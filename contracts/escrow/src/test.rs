@@ -183,6 +183,29 @@ fn test_auto_release_before_window_fails() {
 }
 
 #[test]
+#[should_panic(expected = "escrow not funded")]
+fn test_raise_dispute_only_once() {
+    let (env, seller, buyer, resolver, _admin, token) = setup_env();
+
+    let contract_id = env.register(Escrow, ());
+    let client = super::EscrowClient::new(&env, &contract_id);
+
+    mint_tokens(&env, &token, &buyer, 1000);
+
+    let id = client.create_escrow(&seller, &resolver, &token, &100_i128, &3600_u64);
+    client.fund_escrow(&id, &buyer);
+
+    // First dispute — succeeds, state transitions to Disputed
+    client.raise_dispute(&id);
+
+    let escrow = client.get_escrow(&id);
+    assert_eq!(escrow.state, EscrowState::Disputed);
+
+    // Second dispute on the same escrow — must panic because state is no longer Funded
+    client.raise_dispute(&id);
+}
+
+#[test]
 fn test_multiple_escrows() {
     let (env, seller, buyer, resolver, _admin, token) = setup_env();
 
