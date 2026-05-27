@@ -1,41 +1,111 @@
 #![no_std]
+//! # TrustLink Escrow Contract
+//!
+//! A trustless escrow system for Stellar that enables secure peer-to-peer transactions
+//! between buyers and sellers with optional dispute resolution.
+//!
+//! ## Overview
+//!
+//! This contract implements a state machine for escrow transactions where:
+//! - Sellers create escrows specifying terms and a trusted resolver
+//! - Buyers fund escrows by locking tokens in the contract
+//! - Funds are released upon delivery confirmation or after a shipping window expires
+//! - Disputes can be raised and resolved by a designated third-party resolver
+//!
+//! ## State Machine
+//!
+//! ```text
+//! Pending -> Funded -> Completed
+//!              |
+//!              +-----> Disputed -> Completed/Refunded
+//! ```
+
 use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env};
 
+/// Storage keys for persisting escrow data and the global escrow counter.
 #[contracttype]
 pub enum DataKey {
+    /// Key for accessing a specific escrow by its unique ID.
     Escrow(u32),
+    /// Key for the global counter tracking the total number of escrows created.
     EscrowCount,
 }
 
+/// Complete escrow record containing all transaction details and current state.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EscrowData {
+    /// Address of the seller who will receive funds upon successful completion.
     pub seller: Address,
+    /// Address of the buyer who funds the escrow. None until the escrow is funded.
     pub buyer: Option<Address>,
+    /// Address of the trusted third-party resolver who can mediate disputes.
     pub resolver: Address,
+    /// Address of the token contract (SEP-41 compliant) used for the escrow.
     pub token: Address,
+    /// Amount of tokens locked in the escrow.
     pub amount: i128,
+    /// Time window in seconds after funding during which auto-release is not allowed.
     pub shipping_window: u64,
+    /// Ledger timestamp when the escrow was funded. Zero if not yet funded.
     pub funded_at: u64,
+    /// Current lifecycle state of the escrow.
     pub state: EscrowState,
 }
 
+/// Lifecycle states of an escrow transaction.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum EscrowState {
+    /// Escrow created but not yet funded by a buyer.
     Pending,
+    /// Escrow funded and awaiting delivery confirmation or dispute.
     Funded,
+    /// Escrow successfully completed with funds released to the seller.
     Completed,
+    /// Escrow in dispute, awaiting resolver decision.
     Disputed,
+    /// Escrow refunded to the buyer after dispute resolution.
     Refunded,
 }
 
+/// TrustLink escrow contract implementation.
 #[contract]
 pub struct Escrow;
 
 #[contractimpl]
 #[allow(deprecated)]
 impl Escrow {
+    /// Creates a new escrow transaction in the Pending state.
+    ///
+    /// This function initializes an escrow with the specified parameters and assigns it
+    /// a unique sequential ID. The escrow remains in the Pending state until a buyer
+    /// funds it via `fund_escrow`.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment providing access to ledger state and storage.
+    /// * `seller` - The address that will receive funds upon successful completion.
+    /// * `resolver` - The address authorized to resolve disputes if they arise.
+    /// * `token` - The address of the SEP-41 token contract to be used for payment.
+    /// * `amount` - The quantity of tokens to be locked in escrow (must be positive).
+    /// * `shipping_window` - Duration in seconds after funding before auto-release is permitted.
+    ///
+    /// # Returns
+    ///
+    /// Returns the unique escrow ID (u32) assigned to this escrow. IDs start at 1 and
+    /// increment sequentially.
+    ///
+    /// # Errors
+    ///
+    /// This function panics if:
+    /// - The seller address fails authentication (does not sign the transaction).
+    /// - Storage operations fail (extremely rare in normal operation).
+    ///
+    /// # Auth
+    ///
+    /// Requires authorization from the `seller` address. The seller must sign this
+    /// transaction to prove they are creating the escrow.
     pub fn create_escrow(
         env: Env,
         seller: Address,
@@ -75,6 +145,36 @@ impl Escrow {
         count
     }
 
+    /// Funds an existing escrow by locking tokens from the buyer into the contract.
+    ///
+    /// This function transitions an escrow from Pending to Funded state. The buyer's
+    /// tokens are transferred to the contract address and held until the escrow is
+    /// completed, disputed, or refunded. The funding timestamp is recorded to enable
+    /// time-based auto-release.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment providing access to ledger state and storage.
+    /// * `escrow_id` - The unique identifier of the escrow to fund.
+    /// * `buyer` - The address providing the funds and becoming the buyer in this escrow.
+    ///
+    /// # Returns
+    ///
+    /// Returns `()` on success. The escrow state is updated to Funded and the buyer
+    /// address is recorded.
+    ///
+    /// # Errors
+    ///
+    /// This function panics if:
+    /// - The escrow with the given `escrow_id` does not exist.
+    /// - The escrow is not in the Pending state (already funded, completed, etc.).
+    /// - The buyer address fails authentication (does not sign the transaction).
+    /// - The token transfer fails (insufficient balance, token contract error, etc.).
+    ///
+    /// # Auth
+    ///
+    /// Requires authorization from the `buyer` address. The buyer must sign this
+    /// transaction and must have sufficient token balance and allowance for the transfer.
     pub fn fund_escrow(env: Env, escrow_id: u32, buyer: Address) {
         buyer.require_auth();
 
@@ -91,7 +191,7 @@ impl Escrow {
         escrow.funded_at = env.ledger().timestamp();
 
         let token_client = token::Client::new(&env, &escrow.token);
-        token_client.transfer(&buyer, &env.current_contract_address(), &escrow.amount);
+        token_client.transfer(&buyer, env.current_contract_address(), &escrow.amount);
 
         env.storage()
             .instance()
@@ -99,6 +199,36 @@ impl Escrow {
         env.events().publish(("fund_escrow",), escrow_id);
     }
 
+    /// Confirms successful delivery and releases escrowed funds to the seller.
+    ///
+    /// This function allows the buyer to confirm that goods or services have been
+    /// delivered satisfactorily. Upon confirmation, the locked tokens are immediately
+    /// transferred from the contract to the seller, and the escrow transitions to
+    /// the Completed state.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment providing access to ledger state and storage.
+    /// * `escrow_id` - The unique identifier of the escrow to complete.
+    ///
+    /// # Returns
+    ///
+    /// Returns `()` on success. The tokens are transferred to the seller and the
+    /// escrow state is updated to Completed.
+    ///
+    /// # Errors
+    ///
+    /// This function panics if:
+    /// - The escrow with the given `escrow_id` does not exist.
+    /// - The escrow is not in the Funded state (not yet funded, already completed, etc.).
+    /// - The buyer address fails authentication (does not sign the transaction).
+    /// - The escrow has no buyer recorded (should never happen if state is Funded).
+    /// - The token transfer fails (contract balance insufficient, token contract error).
+    ///
+    /// # Auth
+    ///
+    /// Requires authorization from the buyer address recorded in the escrow. Only the
+    /// buyer who funded the escrow can confirm delivery.
     pub fn confirm_delivery(env: Env, escrow_id: u32) {
         let escrow: EscrowData = env
             .storage()
@@ -127,6 +257,37 @@ impl Escrow {
         env.events().publish(("confirm_delivery",), escrow_id);
     }
 
+    /// Raises a dispute on a funded escrow with cryptographic evidence.
+    ///
+    /// This function allows the buyer to challenge the transaction by providing a
+    /// 32-byte hash of off-chain evidence (such as a SHA-256 digest of photos,
+    /// messages, or documents). The escrow transitions to the Disputed state and
+    /// funds remain locked until the resolver makes a decision via `resolve_dispute`.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment providing access to ledger state and storage.
+    /// * `escrow_id` - The unique identifier of the escrow to dispute.
+    /// * `evidence_hash` - A 32-byte cryptographic hash of the dispute evidence.
+    ///
+    /// # Returns
+    ///
+    /// Returns `()` on success. The escrow state is updated to Disputed and the
+    /// evidence hash is emitted in the event log.
+    ///
+    /// # Errors
+    ///
+    /// This function panics if:
+    /// - The `evidence_hash` is not exactly 32 bytes in length.
+    /// - The escrow with the given `escrow_id` does not exist.
+    /// - The escrow is not in the Funded state (cannot dispute pending or completed escrows).
+    /// - The buyer address fails authentication (does not sign the transaction).
+    /// - The escrow has no buyer recorded (should never happen if state is Funded).
+    ///
+    /// # Auth
+    ///
+    /// Requires authorization from the buyer address recorded in the escrow. Only the
+    /// buyer who funded the escrow can raise a dispute.
     pub fn raise_dispute(env: Env, escrow_id: u32, evidence_hash: soroban_sdk::Bytes) {
         assert!(
             evidence_hash.len() == 32,
@@ -154,6 +315,38 @@ impl Escrow {
             .publish(("raise_dispute",), (escrow_id, evidence_hash));
     }
 
+    /// Resolves a disputed escrow by releasing funds to either the seller or buyer.
+    ///
+    /// This function allows the designated resolver to make a final decision on a
+    /// disputed escrow. Based on the `release_to_seller` parameter, funds are either
+    /// transferred to the seller (if the dispute is resolved in their favor) or
+    /// refunded to the buyer. The escrow transitions to either Completed or Refunded
+    /// state accordingly.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment providing access to ledger state and storage.
+    /// * `escrow_id` - The unique identifier of the disputed escrow to resolve.
+    /// * `release_to_seller` - If true, funds go to the seller; if false, refunded to buyer.
+    ///
+    /// # Returns
+    ///
+    /// Returns `()` on success. The tokens are transferred to the appropriate party
+    /// and the escrow state is updated to Completed or Refunded.
+    ///
+    /// # Errors
+    ///
+    /// This function panics if:
+    /// - The escrow with the given `escrow_id` does not exist.
+    /// - The escrow is not in the Disputed state (cannot resolve non-disputed escrows).
+    /// - The resolver address fails authentication (does not sign the transaction).
+    /// - The escrow has no buyer recorded (should never happen if state is Disputed).
+    /// - The token transfer fails (contract balance insufficient, token contract error).
+    ///
+    /// # Auth
+    ///
+    /// Requires authorization from the resolver address specified when the escrow was
+    /// created. Only the designated resolver can make dispute resolution decisions.
     pub fn resolve_dispute(env: Env, escrow_id: u32, release_to_seller: bool) {
         let escrow: EscrowData = env
             .storage()
@@ -175,7 +368,7 @@ impl Escrow {
         } else {
             token_client.transfer(
                 &env.current_contract_address(),
-                &escrow.buyer.clone().expect("escrow has no buyer"),
+                escrow.buyer.clone().expect("escrow has no buyer"),
                 &escrow.amount,
             );
         }
@@ -194,6 +387,36 @@ impl Escrow {
             .publish(("resolve_dispute",), (escrow_id, release_to_seller));
     }
 
+    /// Automatically releases escrowed funds to the seller after the shipping window expires.
+    ///
+    /// This function provides a permissionless mechanism to release funds to the seller
+    /// when the buyer has not confirmed delivery or raised a dispute within the
+    /// specified shipping window. Anyone can call this function once the time condition
+    /// is met, preventing funds from being locked indefinitely.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment providing access to ledger state and storage.
+    /// * `escrow_id` - The unique identifier of the escrow to auto-release.
+    ///
+    /// # Returns
+    ///
+    /// Returns `()` on success. The tokens are transferred to the seller and the
+    /// escrow state is updated to Completed.
+    ///
+    /// # Errors
+    ///
+    /// This function panics if:
+    /// - The escrow with the given `escrow_id` does not exist.
+    /// - The escrow is not in the Funded state (cannot auto-release pending or completed escrows).
+    /// - The shipping window has not yet elapsed (current timestamp < funded_at + shipping_window).
+    /// - The token transfer fails (contract balance insufficient, token contract error).
+    ///
+    /// # Auth
+    ///
+    /// No authorization required. This function is intentionally permissionless and can
+    /// be called by anyone once the time-based condition is satisfied. This ensures
+    /// sellers can always receive payment even if the buyer becomes unresponsive.
     pub fn auto_release(env: Env, escrow_id: u32) {
         let escrow: EscrowData = env
             .storage()
@@ -223,6 +446,29 @@ impl Escrow {
         env.events().publish(("auto_release",), escrow_id);
     }
 
+    /// Retrieves the complete data for a specific escrow.
+    ///
+    /// This is a read-only view function that returns all stored information about
+    /// an escrow, including its current state, participant addresses, token details,
+    /// amounts, and timestamps.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment providing access to ledger state and storage.
+    /// * `escrow_id` - The unique identifier of the escrow to retrieve.
+    ///
+    /// # Returns
+    ///
+    /// Returns the complete [`EscrowData`] struct containing all escrow information.
+    ///
+    /// # Errors
+    ///
+    /// This function panics if the escrow with the given `escrow_id` does not exist.
+    ///
+    /// # Auth
+    ///
+    /// No authorization required. This is a public read-only function that can be
+    /// called by anyone to inspect escrow state.
     pub fn get_escrow(env: Env, escrow_id: u32) -> EscrowData {
         env.storage()
             .instance()
