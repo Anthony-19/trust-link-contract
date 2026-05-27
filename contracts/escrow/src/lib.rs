@@ -1,10 +1,16 @@
 #![no_std]
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, token, Address, Env};
+use soroban_sdk::{contract, contracterror, contractimpl, contracttype, token, Address, Env, String, Symbol, BytesN};
 
 /// Maximum protocol fee in basis points (300 = 3%).
 const MAX_FEE_BPS: u32 = 300;
 const DISPUTE_WINDOW: u64 = 172_800;
 const DEFAULT_TTL_EXTENSION: u32 = 120_960;
+
+/// Maximum length for user-supplied string fields.
+/// - `tracking_id`: 64 characters
+/// - `description` in `raise_dispute`: 256 characters
+pub const MAX_TRACKING_ID_LEN: u32 = 64;
+pub const MAX_DESCRIPTION_LEN: u32 = 256;
 
 /// Storage keys for persisting escrow data and the global escrow counter.
 #[contracttype]
@@ -47,37 +53,17 @@ pub struct ContractUnpaused {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum EscrowState {
-    Pending,
-    Funded,
-    Completed,
-    Disputed,
-    Refunded,
+pub struct AdminRotated {
+    pub old_admin: Address,
+    pub new_admin: Address,
+    pub timestamp: u64,
 }
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FeeConfig {
-    pub collector: Address,
-    pub max_fee_bps: u32,
-}
-
-#[contracterror]
-#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
-#[repr(u32)]
-pub enum ContractError {
-    InvalidAmount = 1,
-    InsufficientBalance = 2,
-    EscrowNotFound = 3,
-    InvalidState = 4,
-    NotAuthorized = 5,
-    AlreadyInitialized = 6,
-    FeeExceedsMax = 7,
-    EscrowHasNoBuyer = 8,
-    ShippingWindowNotElapsed = 9,
-    InvalidEvidenceHash = 10,
-    DisputeNotFound = 11,
-    ContractPaused = 12,
+pub struct DeliveryRecorded {
+    pub escrow_id: u64,
+    pub delivered_at: u64,
 }
 
 /// Lifecycle states of an escrow transaction.
@@ -98,6 +84,78 @@ pub enum EscrowState {
     Refunded,
 }
 
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeeConfig {
+    pub collector: Address,
+    pub max_fee_bps: u32,
+}
+
+/// Full escrow record stored in persistent storage.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EscrowData {
+    pub seller: Address,
+    pub buyer: Option<Address>,
+    pub resolver: Address,
+    /// Token contract address — any SEP-41 compliant token (e.g. USDC, EURC, or custom).
+    pub token: Address,
+    pub amount: i128,
+    pub fee_bps: u32,
+    pub shipping_window: u64,
+    pub funded_at: u64,
+    pub dispute_deadline: u64,
+    pub state: EscrowState,
+    pub delivered_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DisputeStatus {
+    Active,
+    Resolved,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DisputeData {
+    pub escrow_id: u64,
+    pub reason: Symbol,
+    pub description: String,
+    pub evidence_hash: BytesN<32>,
+    pub status: DisputeStatus,
+    pub raised_at: u64,
+}
+
+/// Resolution direction for `resolve_dispute`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ResolutionType {
+    Release,
+    Refund,
+}
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum ContractError {
+    InvalidAmount = 1,
+    InsufficientBalance = 2,
+    EscrowNotFound = 3,
+    InvalidState = 4,
+    NotAuthorized = 5,
+    AlreadyInitialized = 6,
+    FeeExceedsMax = 7,
+    EscrowHasNoBuyer = 8,
+    ShippingWindowNotElapsed = 9,
+    InvalidEvidenceHash = 10,
+    DisputeNotFound = 11,
+    ArithmeticError = 12,
+    DisputeWindowClosed = 13,
+    /// A user-supplied string field exceeded its maximum allowed length.
+    InputTooLong = 14,
+}
+
 fn ensure_not_paused(env: &Env) {
     let paused = env
         .storage()
@@ -110,6 +168,72 @@ fn ensure_not_paused(env: &Env) {
 fn require_admin(env: &Env) -> Address {
     env.storage().instance().get(&DataKey::Admin).expect("not initialized")
 }
+
+fn load_escrow(env: &Env, escrow_id: u64) -> Result<EscrowData, ContractError> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::Escrow(escrow_id))
+        .ok_or(ContractError::EscrowNotFound)
+}
+
+fn save_escrow(env: &Env, escrow_id: u64, escrow: &EscrowData) {
+    let ttl: u32 = env
+        .storage()
+        .instance()
+        .get(&DataKey::TtlExtensionLedgers)
+        .unwrap_or(DEFAULT_TTL_EXTENSION);
+    env.storage().persistent().set(&DataKey::Escrow(escrow_id), escrow);
+    env.storage()
+        .persistent()
+        .extend_ttl(&DataKey::Escrow(escrow_id), ttl, ttl);
+}
+
+fn load_dispute(env: &Env, escrow_id: u64) -> Result<DisputeData, ContractError> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::Dispute(escrow_id))
+        .ok_or(ContractError::DisputeNotFound)
+}
+
+fn save_dispute(env: &Env, escrow_id: u64, dispute: &DisputeData) {
+    let ttl: u32 = env
+        .storage()
+        .instance()
+        .get(&DataKey::TtlExtensionLedgers)
+        .unwrap_or(DEFAULT_TTL_EXTENSION);
+    env.storage().persistent().set(&DataKey::Dispute(escrow_id), dispute);
+    env.storage()
+        .persistent()
+        .extend_ttl(&DataKey::Dispute(escrow_id), ttl, ttl);
+}
+
+/// Deducts the protocol fee and transfers the net amount to `recipient`.
+/// The fee remainder stays in the contract for later withdrawal.
+/// Supports any SEP-41 token via the stored `token` address.
+fn deduct_and_transfer(
+    env: &Env,
+    token: &Address,
+    recipient: &Address,
+    amount: i128,
+    fee_bps: u32,
+) -> Result<(), ContractError> {
+    if amount <= 0 {
+        return Err(ContractError::InvalidAmount);
+    }
+    let fee = (amount / 10_000) * (fee_bps as i128)
+        + (amount % 10_000) * (fee_bps as i128) / 10_000;
+    let net = amount.checked_sub(fee).ok_or(ContractError::ArithmeticError)?;
+    if net < 0 {
+        return Err(ContractError::ArithmeticError);
+    }
+    // Instantiate token client from the stored address — works for any SEP-41 token.
+    let token_client = token::Client::new(env, token);
+    token_client.transfer(&env.current_contract_address(), recipient, &net);
+    Ok(())
+}
+
+#[contract]
+pub struct Escrow;
 
 #[contractimpl]
 #[allow(deprecated)]
@@ -133,7 +257,7 @@ impl Escrow {
 
         env.storage().instance().set(&DataKey::Paused, &true);
         env.events().publish(
-            (soroban_sdk::Symbol::new(&env, "contract_paused"),),
+            (Symbol::new(&env, "contract_paused"),),
             ContractPaused {
                 admin,
                 timestamp: env.ledger().timestamp(),
@@ -147,7 +271,7 @@ impl Escrow {
 
         env.storage().instance().set(&DataKey::Paused, &false);
         env.events().publish(
-            (soroban_sdk::Symbol::new(&env, "contract_unpaused"),),
+            (Symbol::new(&env, "contract_unpaused"),),
             ContractUnpaused {
                 admin,
                 timestamp: env.ledger().timestamp(),
@@ -165,7 +289,7 @@ impl Escrow {
         old_admin.require_auth();
         env.storage().instance().set(&DataKey::Admin, &new_admin);
         env.events().publish(
-            (soroban_sdk::Symbol::new(&env, "admin_rotated"),),
+            (Symbol::new(&env, "admin_rotated"),),
             AdminRotated {
                 old_admin,
                 new_admin,
@@ -220,7 +344,7 @@ impl Escrow {
         token_client.transfer(&env.current_contract_address(), &to, &amount);
 
         env.events().publish(
-            (soroban_sdk::Symbol::new(&env, "fees_withdrawn"),),
+            (Symbol::new(&env, "fees_withdrawn"),),
             FeesWithdrawn {
                 token,
                 to,
@@ -280,7 +404,10 @@ impl Escrow {
         Ok(escrow_id)
     }
 
-    pub fn fund_escrow(env: Env, escrow_id: u64, buyer: Address) {
+    /// Buyer funds the escrow. Transfers `amount` of the escrow's token from buyer to contract.
+    /// The token client is instantiated from the address stored in escrow state, ensuring
+    /// compatibility with any SEP-41 compliant token — not just USDC.
+    pub fn fund_escrow(env: Env, escrow_id: u64, buyer: Address) -> Result<(), ContractError> {
         ensure_not_paused(&env);
         buyer.require_auth();
 
@@ -295,6 +422,7 @@ impl Escrow {
         escrow.funded_at = env.ledger().timestamp();
         escrow.dispute_deadline = escrow.funded_at + DISPUTE_WINDOW;
 
+        // Token client is built from the address stored in escrow — works for any SEP-41 token.
         let token_client = token::Client::new(&env, &escrow.token);
         token_client.transfer(&buyer, &env.current_contract_address(), &escrow.amount);
 
@@ -304,8 +432,13 @@ impl Escrow {
     }
 
     /// Seller marks an escrow as shipped. Transitions Funded → Shipped.
-    pub fn mark_shipped(env: Env, escrow_id: u64) {
+    /// `tracking_id` is capped at `MAX_TRACKING_ID_LEN` (64) characters to prevent storage bloat.
+    pub fn mark_shipped(env: Env, escrow_id: u64, tracking_id: String) -> Result<(), ContractError> {
         ensure_not_paused(&env);
+
+        if tracking_id.len() > MAX_TRACKING_ID_LEN {
+            return Err(ContractError::InputTooLong);
+        }
 
         let mut escrow = load_escrow(&env, escrow_id)?;
         if escrow.state != EscrowState::Funded {
@@ -314,7 +447,7 @@ impl Escrow {
         escrow.seller.clone().require_auth();
         escrow.state = EscrowState::Shipped;
         save_escrow(&env, escrow_id, &escrow);
-        env.events().publish(("mark_shipped",), escrow_id);
+        env.events().publish(("mark_shipped",), (escrow_id, tracking_id));
         Ok(())
     }
 
@@ -337,7 +470,7 @@ impl Escrow {
         save_escrow(&env, escrow_id, &escrow);
 
         env.events().publish(
-            (soroban_sdk::Symbol::new(&env, "delivery_recorded"),),
+            (Symbol::new(&env, "delivery_recorded"),),
             DeliveryRecorded { escrow_id, delivered_at },
         );
         Ok(())
@@ -366,14 +499,19 @@ impl Escrow {
         Ok(())
     }
 
+    /// Buyer raises a dispute. `description` is capped at `MAX_DESCRIPTION_LEN` (256) characters.
     pub fn raise_dispute(
         env: Env,
         escrow_id: u64,
-        reason: soroban_sdk::Symbol,
-        description: soroban_sdk::String,
-        evidence_hash: soroban_sdk::BytesN<32>,
-    ) {
+        reason: Symbol,
+        description: String,
+        evidence_hash: BytesN<32>,
+    ) -> Result<(), ContractError> {
         ensure_not_paused(&env);
+
+        if description.len() > MAX_DESCRIPTION_LEN {
+            return Err(ContractError::InputTooLong);
+        }
 
         let escrow = load_escrow(&env, escrow_id)?;
 
@@ -406,10 +544,10 @@ impl Escrow {
         Ok(())
     }
 
-    pub fn resolve_dispute(env: Env, escrow_id: u64, resolution: ResolutionType) {
+    pub fn resolve_dispute(env: Env, escrow_id: u64, resolution: ResolutionType) -> Result<(), ContractError> {
         ensure_not_paused(&env);
 
-        let escrow = load_escrow(&env, escrow_id)?;
+        let mut escrow = load_escrow(&env, escrow_id)?;
 
         if escrow.state != EscrowState::Disputed {
             return Err(ContractError::InvalidState);
@@ -440,8 +578,7 @@ impl Escrow {
 
         deduct_and_transfer(&env, &escrow.token, &recipient, escrow.amount, escrow.fee_bps)?;
 
-        let mut updated = escrow;
-        updated.state = match resolution {
+        escrow.state = match resolution {
             ResolutionType::Release => EscrowState::Completed,
             ResolutionType::Refund => EscrowState::Refunded,
         };
@@ -449,7 +586,7 @@ impl Escrow {
         let mut dispute_data = load_dispute(&env, escrow_id)?;
         dispute_data.status = DisputeStatus::Resolved;
 
-        save_escrow(&env, escrow_id, &updated);
+        save_escrow(&env, escrow_id, &escrow);
         save_dispute(&env, escrow_id, &dispute_data);
 
         env.events().publish(("resolve_dispute",), (escrow_id, resolution));
@@ -470,7 +607,7 @@ impl Escrow {
         env.storage().instance().get(&DataKey::TotalArbitrationFees(token)).unwrap_or(0)
     }
 
-    pub fn auto_release(env: Env, escrow_id: u64) {
+    pub fn auto_release(env: Env, escrow_id: u64) -> Result<(), ContractError> {
         ensure_not_paused(&env);
 
         let escrow = load_escrow(&env, escrow_id)?;
@@ -495,12 +632,12 @@ impl Escrow {
         Ok(())
     }
 
-    pub fn get_escrow(env: Env, escrow_id: u64) -> EscrowData {
-        load_escrow(&env, escrow_id).expect("escrow not found")
+    pub fn get_escrow(env: Env, escrow_id: u64) -> Result<EscrowData, ContractError> {
+        load_escrow(&env, escrow_id)
     }
 
-    pub fn get_dispute(env: Env, escrow_id: u64) -> DisputeData {
-        load_dispute(&env, escrow_id).expect("dispute not found")
+    pub fn get_dispute(env: Env, escrow_id: u64) -> Result<DisputeData, ContractError> {
+        load_dispute(&env, escrow_id)
     }
 
     /// Returns the current protocol fee configuration as a read-only view.
@@ -530,3 +667,7 @@ mod test_helpers;
 mod test_admin;
 mod test_ttl;
 mod test_delivery;
+mod test_double_funding;
+mod test_not_found;
+mod test_string_length;
+mod test_sep41;

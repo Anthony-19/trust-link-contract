@@ -23,7 +23,7 @@ fn test_mark_shipped_transitions_state() {
 
     let id = create_funded_escrow(&env, &client, &seller, &buyer, &resolver, &token, 1000, 100, 3600);
 
-    client.mark_shipped(&id);
+    client.mark_shipped(&id, &soroban_sdk::String::from_str(&env, "TRACK001"));
 
     let escrow = client.get_escrow(&id);
     assert_eq!(escrow.state, EscrowState::Shipped);
@@ -43,7 +43,7 @@ fn test_record_delivery_sets_timestamp() {
 
     let id = create_funded_escrow(&env, &client, &seller, &buyer, &resolver, &token, 1000, 100, 3600);
 
-    client.mark_shipped(&id);
+    client.mark_shipped(&id, &soroban_sdk::String::from_str(&env, "TRACK001"));
 
     advance_time(&env, 60);
     let expected_ts = env.ledger().timestamp();
@@ -88,7 +88,7 @@ fn test_confirm_delivery_after_mark_shipped() {
 
     let id = create_funded_escrow(&env, &client, &seller, &buyer, &resolver, &token, 1000, 0, 3600);
 
-    client.mark_shipped(&id);
+    client.mark_shipped(&id, &soroban_sdk::String::from_str(&env, "TRACK001"));
     advance_time(&env, 172801);
     client.confirm_delivery(&id);
 
