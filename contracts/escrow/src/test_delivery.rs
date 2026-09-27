@@ -688,7 +688,7 @@ fn test_confirm_delivery_from_disputed_state_fails() {
     client.raise_dispute(
         &buyer,
         &id,
-        &Symbol::new(&env, "reason"),
+        &Symbol::new(&env, "OTHER"),
         &SorobanString::from_str(&env, "dispute description"),
         &soroban_sdk::BytesN::from_array(&env, &[0; 32]),
     );
@@ -819,7 +819,7 @@ fn raise_dispute_clears_delivery_proposal() {
     client.raise_dispute(
         &buyer,
         &id,
-        &Symbol::new(&env, "damaged"),
+        &Symbol::new(&env, "DAMAGED"),
         &SorobanString::from_str(&env, "arrived broken"),
         &soroban_sdk::BytesN::from_array(&env, &[0x11; 32]),
     );

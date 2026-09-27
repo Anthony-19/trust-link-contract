@@ -15,6 +15,7 @@ pub mod types;
 
 mod admin;
 mod disputes;
+pub use crate::disputes::DISPUTE_REASONS;
 mod instructions;
 mod internal;
 mod queries;
@@ -366,6 +367,7 @@ mod test_delivery;
 mod test_dispute;
 mod test_dispute_deadline_overflow;
 mod test_dispute_flow;
+mod test_dispute_reason;
 mod test_dispute_timeout;
 mod test_dispute_window;
 mod test_edge_cases;
