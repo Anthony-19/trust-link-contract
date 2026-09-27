@@ -47,7 +47,7 @@ impl Escrow {
             .address
             .require_auth();
 
-        ensure_not_paused(&env)?;
+        ensure_action_not_paused(&env, Symbol::new(&env, "create_escrow"))?;
 
         create_escrow_internal(
             &env,
@@ -248,7 +248,7 @@ impl Escrow {
     /// Cancels a `Pending` escrow that was never funded within
     /// `PENDING_EXPIRY_WINDOW` of its creation. Callable by anyone.
     pub fn auto_cancel_pending(env: Env, escrow_id: u64) -> Result<(), ContractError> {
-        ensure_not_paused(&env)?;
+        ensure_action_not_paused(&env, Symbol::new(&env, "auto_cancel_pending"))?;
         crate::internal::ensure_not_expired(&env, escrow_id)?;
         let mut escrow = load_escrow(&env, escrow_id)?;
 
@@ -426,7 +426,7 @@ impl Escrow {
         // Authenticate before any state reads.
         seller.require_auth();
 
-        ensure_not_paused(&env)?;
+        ensure_action_not_paused(&env, Symbol::new(&env, "create_escrow_multi"))?;
 
         if amount <= 0 {
             return Err(ContractError::InvalidAmount);
@@ -519,7 +519,7 @@ impl Escrow {
         content: String,
     ) -> Result<(), ContractError> {
         sender.require_auth();
-        ensure_not_paused(&env)?;
+        ensure_action_not_paused(&env, Symbol::new(&env, "post_message"))?;
         let escrow = load_escrow(&env, escrow_id)?;
 
         let mut is_payee = false;
@@ -673,7 +673,7 @@ impl Escrow {
         // Authenticate before any state reads.
         seller.require_auth();
 
-        ensure_not_paused(&env)?;
+        ensure_action_not_paused(&env, Symbol::new(&env, "create_escrow_with_fallback"))?;
 
         if amount <= 0 {
             return Err(ContractError::InvalidAmount);
@@ -758,7 +758,7 @@ impl Escrow {
     /// `escrow_canceled`.
     pub fn cancel_escrow(env: Env, caller: Address, escrow_id: u64) -> Result<(), ContractError> {
         caller.require_auth();
-        ensure_not_paused(&env)?;
+        ensure_action_not_paused(&env, Symbol::new(&env, "cancel_escrow"))?;
         crate::internal::ensure_not_expired(&env, escrow_id)?;
         let mut escrow = load_escrow(&env, escrow_id)?;
 
@@ -841,7 +841,7 @@ impl Escrow {
     /// terminal-state error). Cancelling a `Shipped` escrow also drops any
     /// pending delivery proposal, which can only exist in that state.
     pub fn mutual_cancel(env: Env, escrow_id: u64) -> Result<(), ContractError> {
-        ensure_not_paused(&env)?;
+        ensure_action_not_paused(&env, Symbol::new(&env, "mutual_cancel"))?;
         crate::internal::ensure_not_expired(&env, escrow_id)?;
         let mut escrow = load_escrow(&env, escrow_id)?;
         let buyer = escrow
@@ -893,7 +893,7 @@ impl Escrow {
         tracking_id: String,
     ) -> Result<(), ContractError> {
         caller.require_auth();
-        ensure_not_paused(&env)?;
+        ensure_action_not_paused(&env, Symbol::new(&env, "mark_shipped"))?;
         crate::internal::ensure_not_expired(&env, escrow_id)?;
         let mut escrow = load_escrow(&env, escrow_id)?;
 
@@ -1148,7 +1148,7 @@ impl Escrow {
         waive_shipping_window: bool,
     ) -> Result<(), ContractError> {
         caller.require_auth();
-        ensure_not_paused(&env)?;
+        ensure_action_not_paused(&env, Symbol::new(&env, "confirm_delivery"))?;
         crate::internal::ensure_not_expired(&env, escrow_id)?;
         let mut escrow = load_escrow(&env, escrow_id)?;
 
@@ -1205,7 +1205,7 @@ impl Escrow {
     ) -> Result<(), ContractError> {
         caller.require_auth();
 
-        ensure_not_paused(&env)?;
+        ensure_action_not_paused(&env, Symbol::new(&env, "co_signed_release"))?;
         let escrow = load_escrow(&env, escrow_id)?;
 
         let first_payee = escrow
@@ -1291,7 +1291,7 @@ impl Escrow {
     /// fee, distributes the remainder across `payees`, and transitions the
     /// escrow to `Completed`. Emits `auto_released`.
     pub fn auto_release(env: Env, escrow_id: u64) -> Result<(), ContractError> {
-        ensure_not_paused(&env)?;
+        ensure_action_not_paused(&env, Symbol::new(&env, "auto_release"))?;
         crate::internal::ensure_not_expired(&env, escrow_id)?;
         let mut escrow = load_escrow(&env, escrow_id)?;
 
@@ -1334,7 +1334,7 @@ impl Escrow {
         shipping_window: u64,
     ) -> Result<u64, ContractError> {
         seller.require_auth();
-        ensure_not_paused(&env)?;
+        ensure_action_not_paused(&env, Symbol::new(&env, "create_basket_escrow"))?;
 
         if tokens.len() != amounts.len() || tokens.is_empty() {
             return Err(ContractError::BasketTokenMismatch);
@@ -1586,7 +1586,7 @@ impl Escrow {
         new_resolver: Address,
     ) -> Result<(), ContractError> {
         caller.require_auth();
-        ensure_not_paused(&env)?;
+        ensure_action_not_paused(&env, Symbol::new(&env, "rotate_resolver"))?;
 
         let mut escrow = load_escrow(&env, escrow_id)?;
         let admin = require_admin(&env)?;
@@ -1666,7 +1666,7 @@ impl Escrow {
     /// `refund_requested`.
     pub fn request_refund(env: Env, caller: Address, escrow_id: u64) -> Result<(), ContractError> {
         caller.require_auth();
-        ensure_not_paused(&env)?;
+        ensure_action_not_paused(&env, Symbol::new(&env, "request_refund"))?;
         crate::internal::ensure_not_expired(&env, escrow_id)?;
         let mut escrow = load_escrow(&env, escrow_id)?;
 
@@ -1724,7 +1724,7 @@ impl Escrow {
     /// Emits `refund_approved`.
     pub fn approve_refund(env: Env, caller: Address, escrow_id: u64) -> Result<(), ContractError> {
         caller.require_auth();
-        ensure_not_paused(&env)?;
+        ensure_action_not_paused(&env, Symbol::new(&env, "approve_refund"))?;
         crate::internal::ensure_not_expired(&env, escrow_id)?;
         let mut escrow = load_escrow(&env, escrow_id)?;
 
@@ -1781,7 +1781,7 @@ impl Escrow {
         escrows: Vec<EscrowInput>,
     ) -> Result<Vec<u64>, ContractError> {
         seller.require_auth();
-        ensure_not_paused(&env)?;
+        ensure_action_not_paused(&env, Symbol::new(&env, "batch_create_escrow"))?;
 
         let mut escrow_ids = Vec::new(&env);
         for input in escrows {
@@ -1828,7 +1828,7 @@ impl Escrow {
     // `s_get_*` / `s_set_*` pairs mirror the public function names they match.
     #[allow(clippy::similar_names)]
     pub fn multicall(env: Env, calls: Vec<ContractCall>) -> Result<Vec<Val>, ContractError> {
-        ensure_not_paused(&env)?;
+        ensure_action_not_paused(&env, Symbol::new(&env, "multicall"))?;
         if calls.len() > crate::MAX_MULTICALL_BATCH_SIZE {
             return Err(ContractError::MulticallBatchTooLarge);
         }

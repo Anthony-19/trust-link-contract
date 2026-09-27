@@ -85,6 +85,8 @@ pub enum DataKey {
     /// lets buyers reclaim custodied funds without going through the standard
     /// state machine. Absent means false.
     RecoveryMode,
+    /// Configurable 24-hour timelock delay for privileged admin operations.
+    AdminTimelockDelay,
     /// Every admin-tunable fee, limit and toggle, packed into one
     /// [`GlobalConfig`] entry so hot paths pay for a single instance-storage
     /// read instead of one per setting. Supersedes the individual
@@ -560,6 +562,7 @@ pub enum TimelockOperation {
     PauseContract = 16,
     UnpauseContract = 17,
     SetAppealFee = 18,
+    SetTimelockDelay = 19,
 }
 
 /// A queued admin change awaiting the 24-hour timelock delay before it can be
@@ -571,7 +574,7 @@ pub enum TimelockOperation {
 pub struct TimelockProposal {
     pub operation: TimelockOperation,
     pub proposer: Address,
-    pub params: Vec<soroban_sdk::Val>,
+    pub params_hash: BytesN<32>,
     pub queued_at: u64,
     pub ready_at: u64,
 }
