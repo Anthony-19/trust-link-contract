@@ -17,6 +17,7 @@ pub mod storage;
 pub mod types;
 
 mod admin;
+mod dispute_state_machine;
 mod disputes;
 pub use crate::disputes::DISPUTE_REASONS;
 mod instructions;

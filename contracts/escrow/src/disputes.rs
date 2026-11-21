@@ -206,7 +206,10 @@ impl Escrow {
         let mut escrow = load_escrow(&env, escrow_id)?;
 
         if escrow.state != EscrowState::PendingFinalization {
-            return Err(ContractError::NotPendingFinalization);
+            return Err(terminal_state_error(
+                &escrow.state,
+                ContractError::NotPendingFinalization,
+            ));
         }
 
         let mut dispute_data = load_dispute(&env, escrow_id)?;
@@ -369,7 +372,10 @@ impl Escrow {
         let mut escrow = load_escrow(&env, escrow_id)?;
 
         if escrow.state != EscrowState::PendingFinalization {
-            return Err(ContractError::NotPendingFinalization);
+            return Err(terminal_state_error(
+                &escrow.state,
+                ContractError::NotPendingFinalization,
+            ));
         }
 
         let dispute_data = load_dispute(&env, escrow_id)?;
@@ -482,12 +488,12 @@ impl Escrow {
     /// (default 30 days). This prevents a resolver who has gone permanently
     /// offline from locking the escrowed funds forever.
     ///
-    /// Moves the escrow to `PendingFinalization` with a `Refund` resolution,
-    /// reusing the existing appeal/finalization flow; after the appeal window
-    /// `finalize_dispute` pays the buyer. No arbitration or resolver fee is
-    /// charged because no resolver acted. Reverts with `InvalidState` if the
-    /// escrow is not `Disputed`, `NotAuthorized` if `caller` is neither party,
-    /// or `DisputeTimeoutNotElapsed` before the deadline.
+    /// Immediately refunds a disputed escrow after the timeout. No arbitration
+    /// or resolver fee is charged because no resolver acted; configured
+    /// protocol/platform refund fees, if any, are handled consistently with
+    /// finalization. Reverts with `InvalidState` if the escrow is not
+    /// `Disputed`, `NotAuthorized` if `caller` is neither party, or
+    /// `DisputeTimeoutNotElapsed` before the deadline.
     pub fn claim_dispute_timeout(
         env: Env,
         caller: Address,
@@ -495,7 +501,7 @@ impl Escrow {
     ) -> Result<(), ContractError> {
         caller.require_auth();
         ensure_action_not_paused(&env, Symbol::new(&env, "claim_dispute_timeout"))?;
-        let escrow = load_escrow(&env, escrow_id)?;
+        let mut escrow = load_escrow(&env, escrow_id)?;
 
         if escrow.state != EscrowState::Disputed {
             return Err(ContractError::InvalidState);
@@ -515,16 +521,76 @@ impl Escrow {
             return Err(ContractError::DisputeTimeoutNotElapsed);
         }
 
-        let votes = load_resolver_votes(&env, escrow_id);
-        execute_resolution_transition(
+        let mut dispute_data = dispute_data;
+        let fee_config = read_global_config(&env);
+        let protocol_fee = crate::helpers::payout::calculate_fee(escrow.amount, escrow.fee_bps)?;
+        let treasury = if fee_config.platform_fee_bps > 0 {
+            fee_config.treasury.clone()
+        } else {
+            None
+        };
+        let platform_fee = if treasury.is_some() {
+            crate::helpers::payout::calculate_fee(escrow.amount, fee_config.platform_fee_bps)?
+        } else {
+            0
+        };
+        let payout_amount = escrow
+            .amount
+            .checked_sub(protocol_fee)
+            .ok_or(ContractError::AmountCalculationOverflow)?
+            .checked_sub(platform_fee)
+            .ok_or(ContractError::AmountCalculationOverflow)?;
+        let fee_collector = if protocol_fee > 0 {
+            fee_config.fee_collector.clone()
+        } else {
+            None
+        };
+        if protocol_fee > 0 && fee_collector.is_none() {
+            return Err(ContractError::NotInitialized);
+        }
+
+        let prev_state = escrow.state.clone();
+        // The contract address is the stable event/data marker for a timeout:
+        // no resolver acted, so neither the caller nor a dormant resolver is
+        // misidentified as the resolving party.
+        let timeout_resolver = env.current_contract_address();
+        escrow.state = EscrowState::Refunded;
+        dispute_data.status = DisputeStatus::Resolved;
+        dispute_data.set_resolution(ResolutionType::Refund);
+        dispute_data.resolved_by = Some(timeout_resolver.clone());
+        dispute_data.resolved_at = env.ledger().timestamp();
+        dispute_data.arbitration_fee = 0;
+        dispute_data.resolver_fee = 0;
+        dispute_data.fees_charged = true;
+        save_escrow(&env, escrow_id, &escrow, Some(&prev_state));
+        save_dispute(&env, escrow_id, &dispute_data);
+        record_escrow_refunded(&env, escrow_id)?;
+
+        if let Some(treasury) = treasury {
+            payout(&env, &escrow.token, &treasury, platform_fee);
+        }
+        payout(&env, &escrow.token, &buyer, payout_amount);
+        if let Some(fee_collector) = fee_collector {
+            payout(&env, &escrow.token, &fee_collector, protocol_fee);
+        }
+        // Secondary basket tokens are refunded gross, matching the existing
+        // refund paths and ensuring no dormant resolver receives them.
+        payout_basket_tokens(&env, escrow_id, &buyer, None)?;
+
+        emit_dispute_resolved(
             &env,
             escrow_id,
-            escrow,
-            caller,
+            timeout_resolver,
             ResolutionType::Refund,
-            votes,
-            false,
-        )
+            buyer,
+            escrow.amount,
+            0,
+            0,
+            platform_fee,
+            prev_state,
+            EscrowState::Refunded,
+        );
+        Ok(())
     }
 
     /// Permissionless, time-based escape hatch for a multi-resolver deadlock.

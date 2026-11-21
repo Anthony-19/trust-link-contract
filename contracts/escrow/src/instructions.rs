@@ -441,22 +441,24 @@ impl Escrow {
         // adds no overhead for contracts that have not enabled the allowlist.
         is_token_allowed(&env, &token)?;
 
-        // Validate multi-resolver configuration
-        let resolver_set = ResolverSet::Multi(crate::types::MultiResolver {
-            resolvers,
-            threshold,
-        });
-        validate_resolvers(&resolver_set, &seller, buyer.as_ref())?;
-
-        let escrow_id = crate::next_escrow_id(&env)?;
-
         let mut payees = Vec::new(&env);
         payees.push_back(Payee {
             address: seller.clone(),
             bps: 10_000,
         });
+        let payees = BoundedPayees { inner: payees };
+
+        // Validate multi-resolver configuration
+        let resolver_set = ResolverSet::Multi(crate::types::MultiResolver {
+            resolvers,
+            threshold,
+        });
+        validate_resolvers(&resolver_set, &payees, buyer.as_ref())?;
+
+        let escrow_id = crate::next_escrow_id(&env)?;
+
         let escrow = EscrowData {
-            payees: BoundedPayees { inner: payees },
+            payees,
             buyer,
             resolvers: resolver_set.clone(),
             token,
@@ -686,7 +688,13 @@ impl Escrow {
             backup: backup_resolver,
             dispute_deadline,
         });
-        validate_resolvers(&resolver_set, &seller, buyer.as_ref())?;
+        let mut payees = Vec::new(&env);
+        payees.push_back(Payee {
+            address: seller.clone(),
+            bps: 10_000,
+        });
+        let payees = BoundedPayees { inner: payees };
+        validate_resolvers(&resolver_set, &payees, buyer.as_ref())?;
 
         // Issue #813: Use centralized next_escrow_id helper instead of duplicating
         // counter logic. This ensures TTL extension is always applied and the counter
@@ -695,13 +703,8 @@ impl Escrow {
         // implementation was identical but spread across multiple functions.
         let escrow_id = crate::next_escrow_id(&env)?;
 
-        let mut payees = Vec::new(&env);
-        payees.push_back(Payee {
-            address: seller.clone(),
-            bps: 10_000,
-        });
         let escrow = EscrowData {
-            payees: BoundedPayees { inner: payees },
+            payees,
             buyer,
             resolvers: resolver_set,
             token,
